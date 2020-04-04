@@ -1,13 +1,16 @@
-import json
 import logging
 from collections import defaultdict
-from concurrent.futures.thread import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from datetime import datetime
 from math import ceil
-from typing import Tuple, List, Iterable, Dict
+import threading
+from typing import Tuple, List, Iterable, Dict, Set
 
 import requests
 from bs4 import BeautifulSoup, Tag
+
+from src.db import PriceTrack, db
 
 logger = logging.getLogger()
 
@@ -66,7 +69,14 @@ def get_num_pages(category: str, sub_category: str) -> Tuple[str, str, int]:
     return category, sub_category, num_pages
 
 
-def get_prices(category: str, sub_category: str, page: int) -> List[ProductInfo]:
+# Keep track of the products to be inserted to avoid inserting the same product twice
+# and get a KeyViolationError subsequently. This happens if a product appears in more
+# than one category. TODO: think of a better way to handle this
+to_be_inserted_lock = threading.Lock()
+to_be_inserted: Set[str] = set()
+
+
+def get_prices(category: str, sub_category: str, page: int, scrape_timestamp: datetime) -> None:
     """
     Scrapes and returns all product infos given a category, a sub category, and a page number.
     """
@@ -78,32 +88,45 @@ def get_prices(category: str, sub_category: str, page: int) -> List[ProductInfo]
         )
     )
     soup = BeautifulSoup(response.text, "html.parser")
-    elements: Iterable[Tag] = soup.findAll(attrs={"data-pcode": True})
+    content: Tag = soup.find(attrs={"class": "search-product-list-content"})
+    elements: Iterable[Tag] = content.findChildren(attrs={"data-pcode": True})
 
     for el in elements:
         el.findChild(attrs={"class": "product-name"}, recursive=True)
 
-    def _element_to_product_info(el: Tag) -> ProductInfo:
+    def _element_to_product_info(el: Tag) -> PriceTrack:
         div: Tag = el.findChild(attrs={"class": "product-name"}, recursive=True)
-        return ProductInfo(
-            code=el.attrs["data-pcode"],
-            name=div.findChild().text,
-            category=category,
-            sub_category=sub_category,
+        return PriceTrack(
+            store="mediaworld",
+            product_id=el.attrs["data-pcode"],
+            product_name=div.findChild().text,
+            category_1=category,
+            category_2=sub_category,
             price=float(el.attrs["data-gtm-price"]),
+            scrape_timestamp=scrape_timestamp,
         )
 
-    return [_element_to_product_info(el) for el in elements]
+    price_tracks = [_element_to_product_info(el) for el in elements]
+    with to_be_inserted_lock:
+        price_tracks = [p for p in price_tracks if p.product_id not in to_be_inserted]
+        to_be_inserted.update(p.product_id for p in price_tracks)
+
+    if price_tracks:
+        with db.session() as session:
+            session.add_all(price_tracks)
+
+    logger.info(f"Stored {category} - {sub_category} - page {page} ({len(price_tracks)} elements)")
 
 
 def main():
+    scrape_timestamp = datetime.now()
+
     logger.info("Begin scraping categories")
     categories = get_categories()
     logger.info("Stopped scraping categories")
 
     with ThreadPoolExecutor() as pool:
         logger.info("Begin scraping number of pages")
-
         categories_and_num_pages = list(
             pool.map(
                 lambda p: get_num_pages(*p),
@@ -114,29 +137,17 @@ def main():
                 ],
             )
         )
-
         logger.info("Stopped scraping number of pages")
 
         logger.info("Begin scraping products information")
-        products = list(
-            pool.map(
-                lambda p: get_prices(*p),
-                [
-                    (category, sub_category, page)
-                    for category, sub_category, num_pages in categories_and_num_pages
-                    for page in range(1, num_pages + 1)
-                ],
-            )
-        )
+        _ = [
+            pool.submit(get_prices, category, sub_category, page, scrape_timestamp)
+            for category, sub_category, num_pages in categories_and_num_pages
+            for page in range(1, num_pages + 1)
+        ]
 
-        # Unroll list of lists into a single list
-        products = [p for prod in products for p in prod]
-        logger.info("Stopped scraping products information")
-
+    logger.info("Stopped scraping products information")
     logger.info("Scraping done")
-
-    with open("../products.json", "w") as f:
-        json.dump([p.__dict__ for p in products], f, indent=2)
 
 
 if __name__ == "__main__":
