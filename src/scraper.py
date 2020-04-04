@@ -1,13 +1,13 @@
+import json
+import logging
+from collections import defaultdict
 from concurrent.futures.thread import ThreadPoolExecutor
 from dataclasses import dataclass
-import logging
-import json
 from math import ceil
-from typing import Tuple, List, Iterable
+from typing import Tuple, List, Iterable, Dict
 
 import requests
 from bs4 import BeautifulSoup, Tag
-from src.categories import CATEGORIES
 
 logger = logging.getLogger()
 
@@ -19,7 +19,27 @@ MEDIAWORLD_PRODUCT_LIST_WITH_PAGE_URL = MEDIAWORLD_PRODUCT_LIST_URL + "?pageNumb
 @dataclass
 class ProductInfo:
     code: str
+    name: str
+    category: str
+    sub_category: str
     price: float
+
+
+def get_categories() -> Dict[str, List[str]]:
+    """
+    Scrapes categories and sub categories from the main page
+    """
+    response = requests.get(MEDIAWORLD_URL)
+    soup = BeautifulSoup(response.text, "html.parser")
+    bar: Tag = soup.find(id="block-catalogomenublock")
+    elements = bar.findChildren("a", attrs={"class": "level2-link"}, recursive=True)
+
+    categories = defaultdict(list)
+    for el in elements:
+        if "catalogo" in el["href"]:
+            category, sub_category = el["href"].split("/")[-2:]
+            categories[category].append(sub_category)
+    return dict(categories)
 
 
 def get_num_pages(category: str, sub_category: str) -> Tuple[str, str, int]:
@@ -60,13 +80,27 @@ def get_prices(category: str, sub_category: str, page: int) -> List[ProductInfo]
     soup = BeautifulSoup(response.text, "html.parser")
     elements: Iterable[Tag] = soup.findAll(attrs={"data-pcode": True})
 
-    return [
-        ProductInfo(code=el.attrs["data-pcode"], price=float(el.attrs["data-gtm-price"]))
-        for el in elements
-    ]
+    for el in elements:
+        el.findChild(attrs={"class": "product-name"}, recursive=True)
+
+    def _element_to_product_info(el: Tag) -> ProductInfo:
+        div: Tag = el.findChild(attrs={"class": "product-name"}, recursive=True)
+        return ProductInfo(
+            code=el.attrs["data-pcode"],
+            name=div.findChild().text,
+            category=category,
+            sub_category=sub_category,
+            price=float(el.attrs["data-gtm-price"]),
+        )
+
+    return [_element_to_product_info(el) for el in elements]
 
 
 def main():
+    logger.info("Begin scraping categories")
+    categories = get_categories()
+    logger.info("Stopped scraping categories")
+
     with ThreadPoolExecutor() as pool:
         logger.info("Begin scraping number of pages")
 
@@ -75,8 +109,8 @@ def main():
                 lambda p: get_num_pages(*p),
                 [
                     (category, sub_category)
-                    for category in CATEGORIES
-                    for sub_category in CATEGORIES[category]
+                    for category in categories
+                    for sub_category in categories[category]
                 ],
             )
         )
@@ -106,5 +140,5 @@ def main():
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level="INFO")
+    logging.basicConfig(level="INFO", format="%(asctime)s %(levelname)-8s %(message)s")
     main()
